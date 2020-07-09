@@ -1,75 +1,65 @@
+#include "Timer.h"
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <iostream>
 #include <random>
+using namespace std;
+constexpr static int kCACHE_LINE = 64;
 
-class Timer {
-	typedef std::chrono::time_point<std::chrono::high_resolution_clock> Clock;
-	long long count;
-	bool running;
-	Clock prev_start_;
-	Clock Now() {
-		return std::chrono::high_resolution_clock::now();
-	}
+class CacheAlignedData {
+	void *buf_noalign_, *buf_;
 public:
-	void Start() {
-		running = true;
-		prev_start_ = Now();
-	}
-	void Pause() {
-		if (running) {
-			running = false;
-			auto diff = Now() - prev_start_;
-			count += std::chrono::duration_cast<std::chrono::microseconds>(diff).count();
+	const size_t kNUM_BYTE_;
+	CacheAlignedData(const size_t kNUM_BYTE):
+		buf_noalign_(malloc(kNUM_BYTE + kCACHE_LINE)),
+		buf_(buf_noalign_),
+		kNUM_BYTE_(kNUM_BYTE)
+	{
+		size_t space = kNUM_BYTE_ + kCACHE_LINE;
+		if (align(kCACHE_LINE, kNUM_BYTE_, buf_, space) == nullptr) {
+			abort();
 		}
 	}
-	void Reset() {
-		running = false;
-		count = 0;
+	~CacheAlignedData()
+	{
+		free(buf_noalign_);
 	}
-	long long get_count() {
-		return count;
-	}
-	Timer() {Reset();}
+	void *get() { return buf_; }
 };
 
 class LatencyBench {
-	const long long kNUM_BYTE, kNUM_NODE;
+	struct Node { union {
+		Node *next;
+		char padding[kCACHE_LINE];
+	};};
+	static_assert(sizeof(Node) == kCACHE_LINE, "");
+	void CreateRing(Node *nodes, const size_t kRANGE_NODE);
+	Node* Traverse(Node *head, const size_t kITER);
 public:
-	struct Node { Node *next; } __attribute__ ((aligned (64)));
-	LatencyBench(const long long kNUM_BYTE):
-		kNUM_BYTE(kNUM_BYTE),
-		kNUM_NODE(kNUM_BYTE / sizeof(Node))
-	{
-		nodes_.reset(new Node[kNUM_NODE]);
-	}
-	double Run(const long long kITER, const long long kSIZE);
-private:
-	std::unique_ptr<Node[]> nodes_;
-	void CreateRing(const long long kRANGE_NODE);
-	Node* Traverse(Node *head, const long long kITER);
+	double Run(CacheAlignedData &data, const size_t kITER, const size_t kSIZE);
 };
-
-void LatencyBench::CreateRing(const long long kRANGE_NODE)
+	
+void LatencyBench::CreateRing(Node *nodes, const size_t kRANGE_NODE)
 {
 	if (kRANGE_NODE < 0 or (kRANGE_NODE&(kRANGE_NODE-1)) != 0) {
 		abort();
 	}
 	std::default_random_engine rng;
 	std::uniform_int_distribution<long> uid;
-	nodes_[0].next = nodes_.get();
+	nodes[0].next = nodes;
 	for (int i = 1; i < kRANGE_NODE; ++i) {
-		Node *cur = nodes_.get() + uid(rng) % (i - i%32 + 1);
+		Node *cur = nodes + uid(rng) % (i - i%32 + 1);
 		Node *nxt = cur->next;
-		Node *tail = nodes_.get() + i;
+		Node *tail = nodes + i;
 		cur->next = tail;
 		tail->next = nxt;
 	}
 }
 
-LatencyBench::Node* LatencyBench::Traverse(Node *head, const long long kITER)
+LatencyBench::Node* LatencyBench::Traverse(Node *head, const size_t kITER)
 {
-	for (long long i = 0; i < kITER; ++i) {
+	for (size_t i = 0; i < kITER; ++i) {
 		head = head->next;
 		head = head->next;
 		head = head->next;
@@ -82,26 +72,28 @@ LatencyBench::Node* LatencyBench::Traverse(Node *head, const long long kITER)
 	return head;
 }
 
-double LatencyBench::Run(const long long kITER, const long long kRANGE_BYTE)
+double LatencyBench::Run(CacheAlignedData &data, const size_t kITER, const size_t kRANGE_BYTE)
 {
-	if (kRANGE_BYTE > kNUM_BYTE) {
+	if (kRANGE_BYTE > data.kNUM_BYTE_) {
 		abort();
 	}
-	CreateRing(kRANGE_BYTE / sizeof(Node));
+	Node *nodes = reinterpret_cast<Node*>(data.get());
+	CreateRing(nodes, kRANGE_BYTE / kCACHE_LINE);
 
 	Timer timer;
-	if (Traverse(nodes_.get(), kRANGE_BYTE / sizeof(Node)) == nullptr) { abort(); }
+	if (Traverse(nodes, kRANGE_BYTE / sizeof(Node)) == nullptr) { abort(); }
 	timer.Start();
-	if (Traverse(nodes_.get(), kITER) == nullptr) { abort(); }
+	if (Traverse(nodes, kITER) == nullptr) { abort(); }
 	timer.Pause();
 	return double(timer.get_count()) * 1000 / (kITER * 8);
 }
 
 int main()
 {
-	LatencyBench bench(1ll<<30);
-	for (long long sz = 1ll<<10; sz <= 1ll<<26; sz *= 2) {
-		std::cout << sz << " " << bench.Run(1ll<<26, sz) << std::endl;
+	CacheAlignedData buf(size_t(1)<<30);
+	LatencyBench latency_bench;
+	for (size_t sz = size_t(1)<<10; sz <= size_t(1)<<26; sz *= 2) {
+		cout << sz << " " << latency_bench.Run(buf, size_t(1)<<26, sz) << endl;
 	}
 	return 0;
 }
